@@ -6,10 +6,14 @@
 # capture. This runs once as a oneshot unit that camview and cam-recorder order
 # behind, rather than being duplicated inside each app.
 #
-# No-op on platforms without a media device carrying the sensor, so the same
-# unit can ship everywhere.
+# No-op on platforms that need no media-graph setup, so the same unit ships
+# everywhere. The gate is the presence of the Pi's CFE receiver - NOT the sensor
+# entity: Tegra's media graph also contains a vb56g4a entity, so matching on the
+# sensor made this run on the Orin and then fail on the Pi-specific link syntax
+# ("Unable to parse link"), which took cam-recorder down with it via Requires=.
 set -eu
 
+CFE="${CAM_CFE_ENTITY:-rp1-cfe}"      # the thing that identifies a Pi CFE graph
 SENSOR="${CAM_SENSOR_ENTITY:-vb56g4}"
 W="${CAM_SRC_W:-1124}"
 H="${CAM_SRC_H:-1364}"
@@ -18,17 +22,27 @@ PIXFMT="${CAM_SRC_PIXFMT:-GREY}"
 
 command -v media-ctl >/dev/null 2>&1 || { echo "cam-media-setup: no media-ctl, skipping"; exit 0; }
 
+# Is there a CFE graph here at all? If not, this platform configures itself and
+# there is nothing for us to do - succeed quietly so dependent units still start.
+have_cfe=0
+for m in /dev/media*; do
+    [ -e "$m" ] || continue
+    media-ctl -d "$m" -p 2>/dev/null | grep -qi "$CFE" && have_cfe=1 && break
+done
+[ "$have_cfe" = 1 ] || { echo "cam-media-setup: no '$CFE' in any media graph - nothing to do"; exit 0; }
+
 MD=""
 n=0
 while [ "$n" -lt 30 ]; do
     for m in /dev/media*; do
         [ -e "$m" ] || continue
-        if media-ctl -d "$m" -p 2>/dev/null | grep -qi "$SENSOR"; then MD="$m"; break; fi
+        if media-ctl -d "$m" -p 2>/dev/null | grep -qi "$CFE" &&
+           media-ctl -d "$m" -p 2>/dev/null | grep -qi "$SENSOR"; then MD="$m"; break; fi
     done
     [ -n "$MD" ] && break
     n=$((n + 1)); sleep 1
 done
-[ -n "$MD" ] || { echo "cam-media-setup: no media device with '$SENSOR' - nothing to do"; exit 0; }
+[ -n "$MD" ] || { echo "cam-media-setup: '$CFE' present but no '$SENSOR' yet - giving up"; exit 1; }
 
 echo "cam-media-setup: $MD  ${W}x${H} $FMT"
 media-ctl -d "$MD" -r
