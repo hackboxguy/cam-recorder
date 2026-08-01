@@ -12,6 +12,10 @@ prefix    ?= /usr
 bindir    ?= $(prefix)/bin
 datadir   ?= $(prefix)/share
 unitdir   ?= $(prefix)/lib/systemd/system
+# Under $(prefix) so this lands in /usr/lib on a usrmerge distro (OE fails
+# do_package_qa on anything installed to a bare /lib) and equally correctly on
+# Debian, where /lib is a symlink to /usr/lib.
+udevdir   ?= $(prefix)/lib/udev/rules.d
 sysconfdir ?= /etc
 
 GST_PKGS  := gstreamer-1.0 gstreamer-video-1.0 gio-unix-2.0 glib-2.0
@@ -41,8 +45,8 @@ install: all
 	install -m 0755 scripts/camview $(DESTDIR)$(bindir)/camview
 	install -m 0644 share/rec-dot.png $(DESTDIR)$(datadir)/cam-recorder/
 	install -m 0644 units/*.service $(DESTDIR)$(unitdir)/
-	install -d $(DESTDIR)/lib/udev/rules.d
-	install -m 0644 udev/99-usb-media.rules $(DESTDIR)/lib/udev/rules.d/
+	install -d $(DESTDIR)$(udevdir)
+	install -m 0644 udev/99-usb-media.rules $(DESTDIR)$(udevdir)/
 	install -m 0755 scripts/cam-media-setup $(DESTDIR)$(bindir)/cam-media-setup
 	install -d $(DESTDIR)$(sysconfdir)
 	echo cam-recorder > $(DESTDIR)$(sysconfdir)/cam-display-app
