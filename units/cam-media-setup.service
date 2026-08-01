@@ -1,0 +1,14 @@
+[Unit]
+Description=Configure the camera capture pipeline (Raspberry Pi CFE)
+# Exits 0 doing nothing on platforms that need no media-graph setup (Tegra),
+# so both video units can depend on it unconditionally.
+After=multi-user.target
+Before=cam-recorder.service camview.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/cam-media-setup
+
+[Install]
+WantedBy=multi-user.target

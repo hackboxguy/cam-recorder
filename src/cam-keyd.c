@@ -135,7 +135,7 @@ static void switch_unit(const char *unit)
 
 struct kbd {
 	int  fd;
-	char path[64];
+	char path[288];   /* d_name can be 255 bytes */
 };
 
 /* Every keycode this daemon acts on. Used both to decide which devices are
@@ -202,7 +202,7 @@ static int scan_keyboards(struct kbd *k, int max)
 		return 0;
 
 	while ((de = readdir(d)) && n < max) {
-		char path[64];
+		char path[288];   /* d_name can be 255 bytes */
 		int fd;
 
 		if (strncmp(de->d_name, "event", 5) != 0)

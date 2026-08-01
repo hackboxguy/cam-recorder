@@ -9,6 +9,9 @@ Wants=multi-user.target
 # clean handover instead of the second app failing with "device busy".
 Conflicts=cam-recorder.service
 
+Requires=cam-media-setup.service
+After=cam-media-setup.service
+
 [Service]
 Type=simple
 # Load the sensor driver (udc=1 comes from the packaged /usr/lib/modprobe.d/

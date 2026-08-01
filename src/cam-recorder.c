@@ -67,6 +67,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <linux/videodev2.h>
 
 #define DEFAULT_DEVICE      "/dev/video0"
 #define DEFAULT_SOCKET      "/run/cam-recorder.sock"
@@ -122,6 +125,10 @@ typedef struct {
 	gboolean    require_mount;  /* recdir's parent must be a real mount point */
 	gint        dq_buffers;     /* display queue depth; 0 = GStreamer defaults */
 	gboolean    no_tee;         /* diagnostic: chain src straight to the display */
+	gboolean    generic;        /* TRUE = no Tegra elements (Pi 5 etc.) */
+	gchar      *platform_arg;   /* "tegra" | "generic" | NULL = autodetect */
+	gchar      *render_rect;    /* generic only: kmssink render-rectangle */
+	gint        io_mode;        /* v4l2src io-mode; -1 = platform default */
 	/* All zero/NULL == "let the device decide". Only what is set is forced. */
 	gint        src_w, src_h, src_fps;
 	gchar      *src_format;
@@ -220,6 +227,116 @@ static void push_state(Recorder *r)
 	g_free(line);
 }
 
+/* ------------------------------------------------------------ platform probe */
+
+/*
+ * Ask the V4L2 node what format it is currently configured for.
+ *
+ * Needed on the Pi: its RP1 CFE is set up out-of-band by cam-media-setup
+ * (media-ctl + v4l2-ctl), and linking v4l2src UNFILTERED then fails with
+ * "Buffer pool activation failed / Failed to allocate required memory" - the
+ * probe-driven negotiation picks something the CFE cannot allocate. Pinning the
+ * caps to what the device already reports keeps the "device decides" behaviour
+ * while giving v4l2src a format it can actually use.
+ *
+ * Tegra does not need this (its tegracam node negotiates fine unfiltered), so
+ * it is only applied on generic.
+ */
+static gboolean query_device_fmt(const char *dev, gint *w, gint *h, const gchar **fmt)
+{
+	struct v4l2_format f;
+	int fd = open(dev, O_RDWR);
+
+	if (fd < 0)
+		return FALSE;
+	memset(&f, 0, sizeof(f));
+	f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	if (ioctl(fd, VIDIOC_G_FMT, &f) != 0) {
+		close(fd);
+		return FALSE;
+	}
+	close(fd);
+
+	*w = f.fmt.pix.width;
+	*h = f.fmt.pix.height;
+	switch (f.fmt.pix.pixelformat) {
+	case V4L2_PIX_FMT_GREY:  *fmt = "GRAY8";  break;
+	case V4L2_PIX_FMT_YUYV:  *fmt = "YUY2";   break;
+	case V4L2_PIX_FMT_UYVY:  *fmt = "UYVY";   break;
+	case V4L2_PIX_FMT_NV12:  *fmt = "NV12";   break;
+	case V4L2_PIX_FMT_RGB24: *fmt = "RGB";    break;
+	case V4L2_PIX_FMT_BGR24: *fmt = "BGR";    break;
+	default:                 *fmt = NULL;     break;   /* pin size only */
+	}
+	return (*w > 0 && *h > 0);
+}
+
+/*
+ * Which pipeline shape to build. The two platforms differ only at the ends -
+ * the flip/scale element and the display sink - so this is a runtime choice
+ * rather than a compile-time one, and a single binary serves both.
+ *
+ * Autodetection is "does nvdrmvideosink exist", which is true only on a Tegra
+ * image with the NVIDIA GStreamer plugins installed. --platform overrides it.
+ */
+static gboolean platform_is_generic(Recorder *r)
+{
+	GstElementFactory *f;
+	gboolean generic;
+
+	if (r->platform_arg) {
+		if (!g_ascii_strcasecmp(r->platform_arg, "generic"))
+			return TRUE;
+		if (!g_ascii_strcasecmp(r->platform_arg, "tegra"))
+			return FALSE;
+		g_warning("unknown --platform=%s, autodetecting", r->platform_arg);
+	}
+	f = gst_element_factory_find("nvdrmvideosink");
+	generic = (f == NULL);
+	if (f)
+		gst_object_unref(f);
+	return generic;
+}
+
+/*
+ * Largest mode of the first connected DRM connector.
+ *
+ * Needed because kmssink only negotiates at the DISPLAY MODE SIZE - measured on
+ * Pi 5, where 888x1080 fails not-negotiated(-4) with and without
+ * render-rectangle, while 1920x1080 works. So on generic the display branch
+ * must scale to the panel's mode and position afterwards with render-rectangle,
+ * unlike Tegra where nvdrmvideosink happily takes an arbitrary-sized buffer and
+ * places it with offset-x.
+ */
+static void detect_display_mode(gint *w, gint *h)
+{
+	GDir *d = g_dir_open("/sys/class/drm", 0, NULL);
+	const char *name;
+
+	*w = 1920; *h = 1080;                 /* sane default if nothing is readable */
+	if (!d)
+		return;
+	while ((name = g_dir_read_name(d))) {
+		gchar *st = NULL, *modes = NULL, *pst, *pmo;
+		int mw, mh;
+
+		if (!strchr(name, '-'))           /* connectors look like card1-HDMI-A-1 */
+			continue;
+		pst = g_strdup_printf("/sys/class/drm/%s/status", name);
+		pmo = g_strdup_printf("/sys/class/drm/%s/modes", name);
+		if (g_file_get_contents(pst, &st, NULL, NULL) &&
+		    g_str_has_prefix(st, "connected") &&
+		    g_file_get_contents(pmo, &modes, NULL, NULL) &&
+		    sscanf(modes, "%dx%d", &mw, &mh) == 2 && mw > 0 && mh > 0) {
+			*w = mw; *h = mh;
+			g_free(st); g_free(modes); g_free(pst); g_free(pmo);
+			break;
+		}
+		g_free(st); g_free(modes); g_free(pst); g_free(pmo);
+	}
+	g_dir_close(d);
+}
+
 /* ------------------------------------------------------- record branch mgmt */
 
 /* Built as a bin so start/stop is one link and one unlink. Sink pad of the bin
@@ -234,14 +351,19 @@ static GstElement *build_rec_bin(Recorder *r, const char *path, GError **err)
 	bin   = gst_bin_new("recbin");
 	q     = gst_element_factory_make("queue", "recq");
 	conv  = gst_element_factory_make("videoconvert", "recconv");
-	flip  = gst_element_factory_make("nvvidconv", "recflip");
-	tosys = gst_element_factory_make("nvvidconv", "rectosys");
+	/* Tegra: nvvidconv does the rotate in hardware and a second one pulls the
+	 * frame back out of NVMM for the CPU encoder. Generic: the rotate happens
+	 * once before the tee (cheaper than per-branch), so the record branch only
+	 * needs the colour conversion that videoconvert above already does. */
+	flip  = r->generic ? NULL : gst_element_factory_make("nvvidconv", "recflip");
+	tosys = r->generic ? NULL : gst_element_factory_make("nvvidconv", "rectosys");
 	enc   = gst_element_factory_make("x264enc", "recenc");
 	parse = gst_element_factory_make("h264parse", "recparse");
 	mux   = gst_element_factory_make("qtmux", "recmux");
 	sink  = gst_element_factory_make("filesink", "recsink");
 
-	if (!bin || !q || !conv || !flip || !tosys || !enc || !parse || !mux || !sink) {
+	if (!bin || !q || !conv || !enc || !parse || !mux || !sink ||
+	    (!r->generic && (!flip || !tosys))) {
 		g_set_error(err, G_IO_ERROR, G_IO_ERROR_FAILED,
 			    "missing GStreamer element for the record branch");
 		return NULL;
@@ -253,14 +375,17 @@ static GstElement *build_rec_bin(Recorder *r, const char *path, GError **err)
 	 * the recording. */
 	g_object_set(q, "leaky", 2 /* downstream */, "max-size-buffers", 8,
 		     "max-size-bytes", 0, "max-size-time", (guint64)0, NULL);
-	g_object_set(flip, "flip-method", r->flip_method, NULL);
+	if (flip)
+		g_object_set(flip, "flip-method", r->flip_method, NULL);
 	g_object_set(enc, "tune", 0x4 /* zerolatency */, "speed-preset", 1 /* ultrafast */,
 		     "bitrate", r->bitrate_kbps, "key-int-max", (r->src_fps ? r->src_fps : DEFAULT_FPS_HINT) * 2, NULL);
 	g_object_set(sink, "location", path, "sync", FALSE, "async", FALSE, NULL);
 	/* Let qtmux write a still-playable file if we are killed without EOS. */
 	g_object_set(mux, "faststart", FALSE, "fragment-duration", 1000, NULL);
 
-	gst_bin_add_many(GST_BIN(bin), q, conv, flip, tosys, enc, parse, mux, sink, NULL);
+	gst_bin_add_many(GST_BIN(bin), q, conv, enc, parse, mux, sink, NULL);
+	if (!r->generic)
+		gst_bin_add_many(GST_BIN(bin), flip, tosys, NULL);
 
 	/* link_filtered does NOT take ownership of the caps, so every one of
 	 * these needs an explicit unref on both the success and failure path. */
@@ -268,11 +393,16 @@ static GstElement *build_rec_bin(Recorder *r, const char *path, GError **err)
 	caps_sys  = gst_caps_from_string("video/x-raw,format=(string)I420");
 	caps_rgba = gst_caps_from_string("video/x-raw,format=(string)RGBA");
 
-	ok = gst_element_link(q, conv) &&
-	     gst_element_link_filtered(conv, flip, caps_rgba) &&
-	     gst_element_link_filtered(flip, tosys, caps_nvmm) &&
-	     gst_element_link_filtered(tosys, enc, caps_sys) &&
-	     gst_element_link_many(enc, parse, mux, sink, NULL);
+	if (r->generic)
+		ok = gst_element_link(q, conv) &&
+		     gst_element_link_filtered(conv, enc, caps_sys) &&
+		     gst_element_link_many(enc, parse, mux, sink, NULL);
+	else
+		ok = gst_element_link(q, conv) &&
+		     gst_element_link_filtered(conv, flip, caps_rgba) &&
+		     gst_element_link_filtered(flip, tosys, caps_nvmm) &&
+		     gst_element_link_filtered(tosys, enc, caps_sys) &&
+		     gst_element_link_many(enc, parse, mux, sink, NULL);
 
 	gst_caps_unref(caps_nvmm);
 	gst_caps_unref(caps_sys);
@@ -636,6 +766,7 @@ static GstPadProbeReturn sink_lat_probe(GstPad *pad, GstPadProbeInfo *info, gpoi
 static gboolean build_pipeline(Recorder *r, GError **err)
 {
 	GstElement *src, *q, *conv, *flip, *sink;
+	GstElement *scale = NULL, *conv2 = NULL, *preflip = NULL;
 	GstCaps *caps_src, *caps_rgba, *caps_view;
 	GstBus *bus;
 
@@ -644,17 +775,42 @@ static gboolean build_pipeline(Recorder *r, GError **err)
 	r->tee = gst_element_factory_make("tee", "t");
 	q = r->dispq = gst_element_factory_make("queue", "dispq");
 	conv  = gst_element_factory_make("videoconvert", "dispconv");
-	flip  = gst_element_factory_make("nvvidconv", "dispflip");
 	r->overlay = gst_element_factory_make("gdkpixbufoverlay", "recdot");
-	sink  = gst_element_factory_make("nvdrmvideosink", "dispsink");
 
-	if (!r->pipeline || !src || !r->tee || !q || !conv || !flip || !sink) {
+	if (r->generic) {
+		/* No hardware converter: videoscale does the fit and kmssink the
+		 * presentation. A CPU rotate, when needed, goes BEFORE the tee so
+		 * one pass serves display and record - measured at 2 dropped frames
+		 * in 300 on a Pi 5, so it is affordable here (unlike Tegra, where a
+		 * CPU videoflip halved the frame rate and nvvidconv is free). */
+		flip  = NULL;
+		scale = gst_element_factory_make("videoscale", "dispscale");
+		conv2 = gst_element_factory_make("videoconvert", "dispconv2");
+		sink  = gst_element_factory_make("kmssink", "dispsink");
+		if (r->flip_method)
+			preflip = gst_element_factory_make("videoflip", "preflip");
+	} else {
+		flip  = gst_element_factory_make("nvvidconv", "dispflip");
+		sink  = gst_element_factory_make("nvdrmvideosink", "dispsink");
+	}
+
+	if (!r->pipeline || !src || !r->tee || !q || !conv || !sink ||
+	    (r->generic ? (!scale || !conv2 || (r->flip_method && !preflip)) : !flip)) {
 		g_set_error(err, G_IO_ERROR, G_IO_ERROR_FAILED,
-			    "missing GStreamer element for the display branch");
+			    "missing GStreamer element for the display branch (%s)",
+			    r->generic ? "generic/kmssink" : "tegra/nvdrmvideosink");
 		return FALSE;
 	}
 
 	g_object_set(src, "device", r->device, NULL);
+	/* io-mode: auto negotiation fails on the Pi's RP1 CFE with
+	 * "Buffer pool activation failed / Failed to allocate required memory";
+	 * mmap (2) is what the proven Pi pipeline uses. Tegra is left on auto,
+	 * where v4l2src negotiates DMABuf/DMA_DRM R8 and that path is wanted. */
+	if (r->io_mode >= 0)
+		g_object_set(src, "io-mode", r->io_mode, NULL);
+	else if (r->generic)
+		g_object_set(src, "io-mode", 2 /* mmap */, NULL);
 	/* The display queue MUST be small and leaky. With the GStreamer defaults
 	 * (non-leaky, 200 buffers / 10 MB / 1 s) the live view ran 1-1.5 s behind
 	 * reality; small + leaky made it look live again. Observed on hardware.
@@ -675,17 +831,40 @@ static gboolean build_pipeline(Recorder *r, GError **err)
 		g_object_set(q, "leaky", 2 /* downstream */,
 			     "max-size-buffers", r->dq_buffers,
 			     "max-size-bytes", 0, "max-size-time", (guint64)0, NULL);
-	g_object_set(flip, "flip-method", r->flip_method, NULL);
+	if (flip)
+		g_object_set(flip, "flip-method", r->flip_method, NULL);
+	if (preflip)
+		g_object_set(preflip, "method", 2 /* rotate-180 */, NULL);
+	if (scale)
+		g_object_set(scale, "add-borders", TRUE, NULL);
 	/* Carried over from the stutter fix: sync=true is REQUIRED (the sink
 	 * schedules DRM page-flips off the clock; sync=false blanks the display
 	 * entirely), while qos=false + max-lateness=-1 stop it discarding frames
 	 * it judges late against an undisciplined clock. See
 	 * gmsl-vd56g4/docs/ORIN-WAVESHARE-BRINGUP.md §5. */
-	g_object_set(sink, "sync", TRUE, "qos", FALSE,
-		     "max-lateness", (gint64)-1,
-		     "offset-x", r->offset_x, "offset-y", r->offset_y, NULL);
+	if (r->generic) {
+		/* force-modesetting so this works on a console-only image with no
+		 * compositor holding the CRTC. render-rectangle is the offset-x
+		 * equivalent, but it positions a MODE-SIZED buffer - it cannot be
+		 * used to hand kmssink a smaller one (that fails to negotiate), so
+		 * it is left unset unless asked for. */
+		g_object_set(sink, "sync", TRUE, "force-modesetting", TRUE, NULL);
+		if (r->render_rect)
+			gst_util_set_object_arg(G_OBJECT(sink), "render-rectangle",
+						r->render_rect);
+	} else {
+		g_object_set(sink, "sync", TRUE, "qos", FALSE,
+			     "max-lateness", (gint64)-1,
+			     "offset-x", r->offset_x, "offset-y", r->offset_y, NULL);
+	}
 
-	gst_bin_add_many(GST_BIN(r->pipeline), src, conv, flip, sink, NULL);
+	gst_bin_add_many(GST_BIN(r->pipeline), src, conv, sink, NULL);
+	if (r->generic)
+		gst_bin_add_many(GST_BIN(r->pipeline), scale, conv2, NULL);
+	else
+		gst_bin_add(GST_BIN(r->pipeline), flip);
+	if (preflip)
+		gst_bin_add(GST_BIN(r->pipeline), preflip);
 	if (r->no_tee) {
 		gst_object_unref(r->tee);
 		gst_object_unref(q);
@@ -709,8 +888,12 @@ static gboolean build_pipeline(Recorder *r, GError **err)
 		 * Scaled up because the source is downscaled 1124->888 afterwards;
 		 * 61 px here lands at ~48 px on screen. Alpha 0 hides it without
 		 * renegotiating caps mid-stream. */
+		/* On generic the rotate happens before the tee, so the overlay
+		 * already sees an upright frame and the dot goes top-right
+		 * directly: negative offset-x measures from the right edge. */
 		g_object_set(r->overlay, "location", r->dotfile,
-			     "offset-x", 30, "offset-y", -30,
+			     "offset-x", r->generic ? -30 : 30,
+			     "offset-y", r->generic ? 30 : -30,
 			     "overlay-width", r->dot_size, "overlay-height", r->dot_size,
 			     "alpha", 0.0, NULL);
 		gst_bin_add(GST_BIN(r->pipeline), r->overlay);
@@ -721,6 +904,18 @@ static gboolean build_pipeline(Recorder *r, GError **err)
 	/* Built from the overrides only. If none were given this stays NULL and
 	 * the source link is unfiltered, i.e. the device picks. */
 	caps_src = NULL;
+	if (r->generic && !r->src_w && !r->src_h && !r->src_format) {
+		gint dw = 0, dh = 0;
+		const gchar *df = NULL;
+
+		if (query_device_fmt(r->device, &dw, &dh, &df)) {
+			r->src_w = dw;
+			r->src_h = dh;
+			if (df && !r->src_format)
+				r->src_format = g_strdup(df);
+			g_message("source: device reports %dx%d %s", dw, dh, df ? df : "(unmapped)");
+		}
+	}
 	if (r->src_w || r->src_h || r->src_fps || r->src_format) {
 		caps_src = gst_caps_new_empty_simple("video/x-raw");
 		if (r->src_format)
@@ -734,12 +929,22 @@ static gboolean build_pipeline(Recorder *r, GError **err)
 					    GST_TYPE_FRACTION, r->src_fps, 1, NULL);
 	}
 	caps_rgba = gst_caps_from_string("video/x-raw,format=(string)RGBA");
-	caps_view = gst_caps_new_simple("video/x-raw",
-			"format", G_TYPE_STRING, "RGBA",
-			"width",  G_TYPE_INT, r->view_w,
-			"height", G_TYPE_INT, r->view_h, NULL);
-	gst_caps_set_features(caps_view, 0,
-			gst_caps_features_new("memory:NVMM", NULL));
+	if (r->generic) {
+		/* Plain system memory, and MUST be the display mode size - see
+		 * detect_display_mode(). No format is pinned: kmssink and
+		 * videoconvert negotiate one between them. */
+		caps_view = gst_caps_new_simple("video/x-raw",
+				"width",  G_TYPE_INT, r->view_w,
+				"height", G_TYPE_INT, r->view_h,
+				"pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1, NULL);
+	} else {
+		caps_view = gst_caps_new_simple("video/x-raw",
+				"format", G_TYPE_STRING, "RGBA",
+				"width",  G_TYPE_INT, r->view_w,
+				"height", G_TYPE_INT, r->view_h, NULL);
+		gst_caps_set_features(caps_view, 0,
+				gst_caps_features_new("memory:NVMM", NULL));
+	}
 
 	if (r->no_tee) {
 		/* Diagnostic only: src -> conv directly, exactly camview's shape.
@@ -749,8 +954,12 @@ static gboolean build_pipeline(Recorder *r, GError **err)
 			g_set_error(err, G_IO_ERROR, G_IO_ERROR_FAILED, "display link failed (no-tee)");
 			return FALSE;
 		}
-	} else if (!(caps_src ? gst_element_link_filtered(src, r->tee, caps_src)
-			      : gst_element_link(src, r->tee)) ||
+	} else if (!(preflip
+		     ? ((caps_src ? gst_element_link_filtered(src, preflip, caps_src)
+				  : gst_element_link(src, preflip)) &&
+			gst_element_link(preflip, r->tee))
+		     : (caps_src ? gst_element_link_filtered(src, r->tee, caps_src)
+				 : gst_element_link(src, r->tee))) ||
 		   !gst_element_link(r->tee, q) ||
 		   !gst_element_link(q, conv)) {
 		g_set_error(err, G_IO_ERROR, G_IO_ERROR_FAILED, "display link failed (front)");
@@ -758,17 +967,33 @@ static gboolean build_pipeline(Recorder *r, GError **err)
 	}
 	/* conv -> [overlay] -> flip: the overlay works in SYSTEM memory RGBA. */
 	if (r->overlay) {
-		if (!gst_element_link_filtered(conv, r->overlay, caps_rgba) ||
-		    !gst_element_link(r->overlay, flip)) {
+		/* RGBA because gdkpixbufoverlay needs an alpha channel to blend. */
+		if (!gst_element_link_filtered(conv, r->overlay, caps_rgba)) {
 			g_set_error(err, G_IO_ERROR, G_IO_ERROR_FAILED,
 				    "display link failed (overlay)");
 			return FALSE;
 		}
-	} else if (!gst_element_link_filtered(conv, flip, caps_rgba)) {
+		if (!r->generic && !gst_element_link(r->overlay, flip)) {
+			g_set_error(err, G_IO_ERROR, G_IO_ERROR_FAILED,
+				    "display link failed (overlay->flip)");
+			return FALSE;
+		}
+	} else if (!r->generic && !gst_element_link_filtered(conv, flip, caps_rgba)) {
 		g_set_error(err, G_IO_ERROR, G_IO_ERROR_FAILED, "display link failed (conv)");
 		return FALSE;
 	}
-	if (!gst_element_link_filtered(flip, sink, caps_view)) {
+	if (r->generic) {
+		/* overlay/conv -> videoconvert -> videoscale -> [mode size] -> kmssink */
+		GstElement *head = r->overlay ? r->overlay : conv;
+
+		if (!gst_element_link(head, conv2) ||
+		    !gst_element_link(conv2, scale) ||
+		    !gst_element_link_filtered(scale, sink, caps_view)) {
+			g_set_error(err, G_IO_ERROR, G_IO_ERROR_FAILED,
+				    "display link failed (generic sink)");
+			return FALSE;
+		}
+	} else if (!gst_element_link_filtered(flip, sink, caps_view)) {
 		g_set_error(err, G_IO_ERROR, G_IO_ERROR_FAILED, "display link failed (sink)");
 		return FALSE;
 	}
@@ -928,9 +1153,10 @@ int main(int argc, char **argv)
 	r.bitrate_kbps = 8000;
 	r.require_mount = TRUE;
 	r.dq_buffers    = 2;
-	r.view_w        = DEFAULT_VIEW_W;
-	r.view_h        = DEFAULT_VIEW_H;
-	r.flip_method   = 2;   /* 180: this camera is mounted inverted. 0 = none. */
+	r.view_w        = 0;   /* 0 => platform default, resolved after gst_init */
+	r.view_h        = 0;
+	r.flip_method   = -1;  /* -1 => platform default */
+	r.io_mode       = -1;
 	r.dot_size      = 61;
 
 	GOptionEntry opts[] = {
@@ -949,6 +1175,12 @@ int main(int argc, char **argv)
 		{ "view-height", 0, 0, G_OPTION_ARG_INT, &r.view_h, "on-screen height", NULL },
 		{ "flip",     0,  0, G_OPTION_ARG_INT, &r.flip_method, "nvvidconv flip-method (2 = 180, 0 = none)", NULL },
 		{ "dot-size", 0,  0, G_OPTION_ARG_INT, &r.dot_size, "REC dot size in source pixels", NULL },
+		{ "platform", 'p', 0, G_OPTION_ARG_STRING, &r.platform_arg,
+		  "tegra | generic (default: autodetect by probing nvdrmvideosink)", NULL },
+		{ "io-mode", 0, 0, G_OPTION_ARG_INT, &r.io_mode,
+		  "v4l2src io-mode (2 = mmap); -1 = platform default", NULL },
+		{ "render-rect", 0, 0, G_OPTION_ARG_STRING, &r.render_rect,
+		  "generic only: kmssink render-rectangle, e.g. \"<516,0,888,1080>\"", NULL },
 		{ "no-tee", 0, 0, G_OPTION_ARG_NONE, &r.no_tee,
 		  "diagnostic: no tee/queue, display only (cannot record)", NULL },
 		{ "dq", 0, 0, G_OPTION_ARG_INT, &r.dq_buffers,
@@ -968,6 +1200,22 @@ int main(int argc, char **argv)
 	g_option_context_free(ctx);
 
 	gst_init(NULL, NULL);
+
+	/* Platform decides the remaining defaults, so it must be settled first. */
+	r.generic = platform_is_generic(&r);
+	if (r.flip_method < 0) {
+		/* Tegra rig (Waveshare/Orin) is mounted inverted; the EVK/Pi rig is
+		 * the right way up - verified from a captured frame. */
+		r.flip_method = r.generic ? 0 : 2;
+	}
+	if (!r.view_w || !r.view_h) {
+		if (r.generic)
+			detect_display_mode(&r.view_w, &r.view_h);
+		else {
+			r.view_w = DEFAULT_VIEW_W;
+			r.view_h = DEFAULT_VIEW_H;
+		}
+	}
 
 	if (!build_pipeline(&r, &err)) {
 		g_printerr("pipeline: %s\n", err ? err->message : "?");
@@ -1006,8 +1254,9 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	g_message("cam-recorder up: device=%s recdir=%s socket=%s media=%s "
-		  "src=%s view=%dx%d flip=%d",
+	g_message("cam-recorder up: platform=%s device=%s recdir=%s socket=%s "
+		  "media=%s src=%s view=%dx%d flip=%d",
+		  r.generic ? "generic" : "tegra",
 		  r.device, r.recdir, r.sockpath, r.media_ready ? "ready" : "absent",
 		  (r.src_w || r.src_h || r.src_fps || r.src_format) ? "forced" : "device-negotiated",
 		  r.view_w, r.view_h, r.flip_method);

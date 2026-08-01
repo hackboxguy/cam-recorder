@@ -1,0 +1,16 @@
+# Mount the first FAT partition of a removable USB disk at /media/usb.
+#
+# systemd-mount is used rather than a static .mount unit because the latter
+# needs a hardcoded What= device path, which is specific to one USB port and
+# breaks the moment the stick is moved. This rule works for whichever device
+# shows up, on any port.
+#
+# uid/gid 1000 = pi, so recordings are owned by the login user and the recorder
+# does not need to run as root. The recorder deliberately does NOT mount
+# anything itself - it stays a pure video app and only asks whether
+# /media/usb/recording is writable.
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z][0-9]", ENV{ID_BUS}=="usb", ENV{ID_FS_TYPE}=="vfat", \
+  RUN+="/usr/bin/systemd-mount --no-block --collect --type=vfat --options=rw,uid=1000,gid=1000,umask=0022,flush /dev/%k /media/usb"
+
+ACTION=="remove", SUBSYSTEM=="block", KERNEL=="sd[a-z][0-9]", ENV{ID_BUS}=="usb", \
+  RUN+="/usr/bin/systemd-umount /media/usb"

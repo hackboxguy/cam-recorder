@@ -1,49 +1,90 @@
 #!/bin/sh
-# camview — show the VD56G4 mono GMSL2 IR camera live on the Orin's local HDMI
-# display via nvdrmvideosink. Run by camview.service on boot, or by hand.
+# camview — minimal live camera view on the local display.
 #
-# Pipeline notes (Fable v6/v7 — do not "simplify" these away):
-#   * v4l2src emits DMABuf/DMA_DRM "R8" (native mono) — do NOT force
-#     `video/x-raw,format=GRAY8` caps: this image's GStreamer (1.28) negotiates
-#     DMA_DRM/R8 from v4l2src, and forcing plain GRAY8 system-memory hits BOTH a
-#     videoconvert/videoflip slow-path bug ("not implemented") AND nvvidconv's
-#     rejection of the padded 1152 stride. Let videoconvert take the DMABuf R8 ->
-#     RGBA (the CPU repack also tightens the stride for nvvidconv). On a future
-#     gst upgrade, re-test whether `v4l2src ! video/x-raw,GRAY8 ! nvvidconv`
-#     works natively — if so this whole chain collapses to that.
-#   * NO bayer2rgb — the sensor is native GREY now (grey_y8 patch); bayer2rgb
-#     would demosaic mono data and add color fringing.
-#   * flip-method=2 (nvvidconv, HARDWARE) corrects the upside-down sensor mount.
-#     Do NOT use videoflip here: a CPU rotate-180 on 1124x1364 nearly HALVES the
-#     frame rate (measured 2026-08-01: 300 frames took 21 s vs 11 s, i.e. ~15 fps
-#     vs 30). nvvidconv folds the rotation into the scale pass it already does,
-#     for free. See docs/video-record-plan.md §3.
-#   * offset-x=0 puts this view on the LEFT; cam-recorder centres itself at
-#     offset-x=516 so the two are visually distinguishable at a glance.
-#   * sync=true is REQUIRED — nvdrmvideosink schedules its DRM page-flips off
-#     the clock, so it must stay synchronised or nothing reaches the display.
-#   * qos=false + max-lateness=-1 disable ONLY the late-buffer dropping. With
-#     the defaults, nvdrmvideosink judged buffers against the clock and
-#     discarded any it considered late (gst_base_sink_is_too_late), so on a
-#     board with no disciplined clock the live feed visibly stuttered while the
-#     camera and CSI link were perfectly healthy. The Orin Nano devkit has NO
-#     battery-backed RTC: with no network, systemd seeds the clock from a stale
-#     /var/lib/systemd/timesync/clock stamp and it then free-runs, drifting
-#     against the sensor's true 30 fps cadence. HW-observed 2026-07-29: 213
-#     "A lot of buffers are being dropped" warnings starting 41 s after boot,
-#     stopping the instant systemd-timesyncd reached a time server once
-#     ethernet was plugged in — with uncorr_err=0 and the GMSL link locked
-#     throughout. A live preview should show every frame it receives; it has no
-#     deadline to miss.
-#     NOTE: sync=false also stops the dropping, but it stops the picture too —
-#     the sink takes the DRM plane (blanking the console) and never flips a
-#     frame onto it. Do not "fix" the stutter that way.
-
+# The quick "is the camera alive" check. cam-recorder is the app that also
+# records; this stays deliberately simple. The two are mutually exclusive
+# (Conflicts= in their units) because /dev/video0 is exclusive.
+#
+# Portable across the two platforms this repo serves, selected at runtime:
+#   tegra    nvvidconv (hardware flip+scale) -> nvdrmvideosink
+#   generic  videoconvert/videoscale (CPU)   -> kmssink
+# Override with CAM_PLATFORM=tegra|generic, CAM_DEVICE=, CAM_FLIP=.
+#
+# No source caps are forced anywhere below - the device decides. That is what
+# lets this work with any sensor, and on tegra it also dodges a negotiation
+# trap: v4l2src emits DMABuf/DMA_DRM "R8" (native mono), and forcing plain
+# GRAY8 system memory hits BOTH a videoconvert/videoflip slow-path bug ("not
+# implemented") AND nvvidconv's rejection of the padded 1152 stride. Letting
+# videoconvert take the DMABuf R8 -> RGBA also tightens the stride for
+# nvvidconv. Do NOT add bayer2rgb: the sensor is native GREY, and demosaicing
+# mono data just adds colour fringing.
 set -eu
 
-DEV="${1:-/dev/video0}"
+DEV="${CAM_DEVICE:-/dev/video0}"
+FLIP="${CAM_FLIP:-}"
 
-exec gst-launch-1.0 -e v4l2src device="$DEV" \
-    ! videoconvert ! video/x-raw,format=RGBA \
-    ! nvvidconv flip-method=2 ! 'video/x-raw(memory:NVMM),format=RGBA,width=888,height=1080' \
-    ! nvdrmvideosink sync=true qos=false max-lateness=-1 offset-x=0
+if [ -n "${CAM_PLATFORM:-}" ]; then
+    PLATFORM="$CAM_PLATFORM"
+elif gst-inspect-1.0 nvdrmvideosink >/dev/null 2>&1; then
+    PLATFORM=tegra
+else
+    PLATFORM=generic
+fi
+
+# Wait for the node: on Pi the media pipeline is configured by a separate
+# oneshot unit, and on tegra the driver may still be probing.
+n=0
+while [ ! -e "$DEV" ] && [ "$n" -lt 30 ]; do n=$((n + 1)); sleep 0.5; done
+[ -e "$DEV" ] || { echo "camview: $DEV never appeared" >&2; exit 1; }
+
+if [ "$PLATFORM" = tegra ]; then
+    # flip-method=2 (nvvidconv, HARDWARE) corrects this rig's upside-down mount.
+    # Do NOT substitute videoflip here: a CPU rotate-180 on 1124x1364 nearly
+    # HALVES the frame rate on this board (measured 300 frames: 21 s vs 11 s).
+    # nvvidconv folds the rotation into the scale pass it already performs.
+    #
+    # sync=true is REQUIRED - nvdrmvideosink schedules DRM page-flips off the
+    # clock, and sync=false blanks the display entirely. qos=false and
+    # max-lateness=-1 disable ONLY the late-buffer dropping: with the defaults
+    # the sink discarded frames it judged late against an undisciplined clock
+    # (the Orin Nano devkit has no battery-backed RTC), so the feed visibly
+    # stuttered while camera and CSI link were perfectly healthy.
+    #
+    # offset-x=0 puts this view on the LEFT; cam-recorder centres itself, so
+    # the two are distinguishable at a glance.
+    [ -n "$FLIP" ] || FLIP=2
+    echo "camview: tegra (flip=$FLIP)"
+    exec gst-launch-1.0 -e v4l2src device="$DEV" \
+        ! videoconvert ! video/x-raw,format=RGBA \
+        ! nvvidconv flip-method="$FLIP" \
+        ! "video/x-raw(memory:NVMM),format=RGBA,width=888,height=1080" \
+        ! nvdrmvideosink sync=true qos=false max-lateness=-1 offset-x=0
+fi
+
+# generic: kmssink only negotiates at the DISPLAY MODE SIZE - a smaller buffer
+# fails not-negotiated(-4) with or without render-rectangle - so scale to the
+# connected panel's mode. add-borders keeps the aspect ratio (this sensor is
+# portrait, the panel is landscape).
+[ -n "$FLIP" ] || FLIP=0
+W=1920; H=1080
+for c in /sys/class/drm/card*/card*-*; do
+    [ "$(cat "$c/status" 2>/dev/null)" = connected ] || continue
+    m="$(head -n 1 "$c/modes" 2>/dev/null)"
+    case "$m" in [0-9]*x[0-9]*) W="${m%x*}"; H="${m#*x}"; break ;; esac
+done
+echo "camview: generic, rendering into ${W}x${H} (flip=$FLIP)"
+
+# A CPU rotate is affordable here (measured 2 dropped frames in 300 on a Pi 5),
+# unlike on tegra - but it is off by default because the EVK rig is mounted the
+# right way up.
+if [ "$FLIP" != 0 ]; then
+    exec gst-launch-1.0 -e v4l2src device="$DEV" io-mode=mmap \
+        ! videoflip method=rotate-180 \
+        ! videoconvert ! videoscale add-borders=true \
+        ! "video/x-raw,width=${W},height=${H},pixel-aspect-ratio=1/1" \
+        ! kmssink force-modesetting=true
+fi
+exec gst-launch-1.0 -e v4l2src device="$DEV" io-mode=mmap \
+    ! videoconvert ! videoscale add-borders=true \
+    ! "video/x-raw,width=${W},height=${H},pixel-aspect-ratio=1/1" \
+    ! kmssink force-modesetting=true

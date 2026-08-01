@@ -7,12 +7,15 @@ Wants=multi-user.target
 # instead of the second app failing with "device busy".
 Conflicts=camview.service
 
+Requires=cam-media-setup.service
+After=cam-media-setup.service
+
 [Service]
 Type=simple
 # The ONE sensor-specific knob in an otherwise camera-agnostic unit. Override
 # with a drop-in (systemctl edit cam-recorder) for a different sensor, or set it
 # empty if the driver is built in or autoloads from the device tree.
-Environment=CAM_MODULE=vb56g4a
+Environment=CAM_MODULE=
 ExecStartPre=-/bin/sh -c '[ -n "$CAM_MODULE" ] && modprobe "$CAM_MODULE"'
 ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/video0 ] && exit 0; sleep 0.5; done; echo "cam-recorder: /dev/video0 never appeared" >&2; exit 1'
 ExecStart=/usr/bin/cam-recorder

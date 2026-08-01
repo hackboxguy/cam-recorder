@@ -1,0 +1,39 @@
+#!/bin/sh
+# cam-media-setup — configure the RP1 CFE capture pipeline (Raspberry Pi 5).
+#
+# Unlike Tegra's tegracam, which hands over a ready /dev/video0, the Pi's CFE
+# needs the media graph linked and formats set on both pads before anything can
+# capture. This runs once as a oneshot unit that camview and cam-recorder order
+# behind, rather than being duplicated inside each app.
+#
+# No-op on platforms without a media device carrying the sensor, so the same
+# unit can ship everywhere.
+set -eu
+
+SENSOR="${CAM_SENSOR_ENTITY:-vb56g4}"
+W="${CAM_SRC_W:-1124}"
+H="${CAM_SRC_H:-1364}"
+FMT="${CAM_SRC_MBUS:-Y8_1X8}"
+PIXFMT="${CAM_SRC_PIXFMT:-GREY}"
+
+command -v media-ctl >/dev/null 2>&1 || { echo "cam-media-setup: no media-ctl, skipping"; exit 0; }
+
+MD=""
+n=0
+while [ "$n" -lt 30 ]; do
+    for m in /dev/media*; do
+        [ -e "$m" ] || continue
+        if media-ctl -d "$m" -p 2>/dev/null | grep -qi "$SENSOR"; then MD="$m"; break; fi
+    done
+    [ -n "$MD" ] && break
+    n=$((n + 1)); sleep 1
+done
+[ -n "$MD" ] || { echo "cam-media-setup: no media device with '$SENSOR' - nothing to do"; exit 0; }
+
+echo "cam-media-setup: $MD  ${W}x${H} $FMT"
+media-ctl -d "$MD" -r
+media-ctl -d "$MD" -l '"csi2":4 -> "rp1-cfe-csi2_ch0":0 [1]'
+media-ctl -d "$MD" -V "\"csi2\":0 [fmt:$FMT/${W}x${H} field:none colorspace:raw]"
+media-ctl -d "$MD" -V "\"csi2\":4 [fmt:$FMT/${W}x${H} field:none colorspace:raw]"
+v4l2-ctl -d /dev/video0 --set-fmt-video=width="$W",height="$H",pixelformat="$PIXFMT" >/dev/null
+echo "cam-media-setup: done"
