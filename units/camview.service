@@ -1,0 +1,26 @@
+[Unit]
+Description=VD56G4 GMSL2 IR camera — live view on the local HDMI display
+Documentation=file:///usr/bin/camview
+# The DRM/framebuffer and the rootfs are up by multi-user.target; nvdrmvideosink
+# takes the DRM plane over fbcon (no X/display-manager on this image).
+After=multi-user.target
+Wants=multi-user.target
+# Only one process may hold /dev/video0. Conflicts= makes "+"/"-" switching a
+# clean handover instead of the second app failing with "device busy".
+Conflicts=cam-recorder.service
+
+[Service]
+Type=simple
+# Load the sensor driver (udc=1 comes from the packaged /usr/lib/modprobe.d/
+# vb56g4a.conf) and wait for the capture node before starting the pipeline. The
+# '-' on modprobe tolerates an already-loaded module.
+ExecStartPre=-/bin/sh -c 'modprobe vb56g4a'
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/video0 ] && exit 0; sleep 0.5; done; echo "camview: /dev/video0 never appeared (driver/overlay?)" >&2; exit 1'
+ExecStart=/usr/bin/camview
+# If the display or capture pipeline hiccups (e.g. DRM not yet ready on a cold
+# boot), retry rather than give up.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

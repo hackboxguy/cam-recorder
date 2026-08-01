@@ -1,0 +1,49 @@
+#!/bin/sh
+# camview — show the VD56G4 mono GMSL2 IR camera live on the Orin's local HDMI
+# display via nvdrmvideosink. Run by camview.service on boot, or by hand.
+#
+# Pipeline notes (Fable v6/v7 — do not "simplify" these away):
+#   * v4l2src emits DMABuf/DMA_DRM "R8" (native mono) — do NOT force
+#     `video/x-raw,format=GRAY8` caps: this image's GStreamer (1.28) negotiates
+#     DMA_DRM/R8 from v4l2src, and forcing plain GRAY8 system-memory hits BOTH a
+#     videoconvert/videoflip slow-path bug ("not implemented") AND nvvidconv's
+#     rejection of the padded 1152 stride. Let videoconvert take the DMABuf R8 ->
+#     RGBA (the CPU repack also tightens the stride for nvvidconv). On a future
+#     gst upgrade, re-test whether `v4l2src ! video/x-raw,GRAY8 ! nvvidconv`
+#     works natively — if so this whole chain collapses to that.
+#   * NO bayer2rgb — the sensor is native GREY now (grey_y8 patch); bayer2rgb
+#     would demosaic mono data and add color fringing.
+#   * flip-method=2 (nvvidconv, HARDWARE) corrects the upside-down sensor mount.
+#     Do NOT use videoflip here: a CPU rotate-180 on 1124x1364 nearly HALVES the
+#     frame rate (measured 2026-08-01: 300 frames took 21 s vs 11 s, i.e. ~15 fps
+#     vs 30). nvvidconv folds the rotation into the scale pass it already does,
+#     for free. See docs/video-record-plan.md §3.
+#   * offset-x=0 puts this view on the LEFT; cam-recorder centres itself at
+#     offset-x=516 so the two are visually distinguishable at a glance.
+#   * sync=true is REQUIRED — nvdrmvideosink schedules its DRM page-flips off
+#     the clock, so it must stay synchronised or nothing reaches the display.
+#   * qos=false + max-lateness=-1 disable ONLY the late-buffer dropping. With
+#     the defaults, nvdrmvideosink judged buffers against the clock and
+#     discarded any it considered late (gst_base_sink_is_too_late), so on a
+#     board with no disciplined clock the live feed visibly stuttered while the
+#     camera and CSI link were perfectly healthy. The Orin Nano devkit has NO
+#     battery-backed RTC: with no network, systemd seeds the clock from a stale
+#     /var/lib/systemd/timesync/clock stamp and it then free-runs, drifting
+#     against the sensor's true 30 fps cadence. HW-observed 2026-07-29: 213
+#     "A lot of buffers are being dropped" warnings starting 41 s after boot,
+#     stopping the instant systemd-timesyncd reached a time server once
+#     ethernet was plugged in — with uncorr_err=0 and the GMSL link locked
+#     throughout. A live preview should show every frame it receives; it has no
+#     deadline to miss.
+#     NOTE: sync=false also stops the dropping, but it stops the picture too —
+#     the sink takes the DRM plane (blanking the console) and never flips a
+#     frame onto it. Do not "fix" the stutter that way.
+
+set -eu
+
+DEV="${1:-/dev/video0}"
+
+exec gst-launch-1.0 -e v4l2src device="$DEV" \
+    ! videoconvert ! video/x-raw,format=RGBA \
+    ! nvvidconv flip-method=2 ! 'video/x-raw(memory:NVMM),format=RGBA,width=888,height=1080' \
+    ! nvdrmvideosink sync=true qos=false max-lateness=-1 offset-x=0

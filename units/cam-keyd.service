@@ -1,0 +1,14 @@
+[Unit]
+Description=Keyboard control for the camera video apps (record toggle / app switch)
+Documentation=file:///usr/bin/cam-keyd
+After=multi-user.target
+
+[Service]
+Type=simple
+# Root for /dev/input/* and for systemctl start of the video units.
+ExecStart=/usr/bin/cam-keyd
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
